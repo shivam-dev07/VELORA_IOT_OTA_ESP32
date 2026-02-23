@@ -1,11 +1,12 @@
 /**
- * Velora IoT Platform — ESP32 OTA + Telemetry Sketch
- * ====================================================
+ * Velora IoT Platform — ESP32 Full Featured Sketch
+ * ==================================================
  * Features:
- *   1. Sends sensor telemetry every 5 seconds via POST /api/v1/telemetry/batch
- *   2. Checks for OTA firmware update every 5 minutes via GET /api/v1/ota/device-check
- *   3. Downloads and applies firmware using ESP32's built-in Update library
- *   4. Reports progress back to platform via POST /api/v1/ota/device-report
+ *   1. Sends sensor telemetry every 5 s    → POST /api/v1/telemetry/batch
+ *   2. Polls dashboard LED command every 2 s → GET  /api/v1/datastreams/:id/value
+ *   3. Checks for OTA firmware update every 5 min → GET /api/v1/ota/device-check
+ *   4. Downloads & applies firmware using ESP32's built-in Update library
+ *   5. Reports OTA progress back to platform → POST /api/v1/ota/device-report
  *
  * Required Arduino libraries (install via Library Manager):
  *   - WiFi         (built-in with ESP32 Arduino core)
@@ -14,6 +15,9 @@
  *   - ArduinoJson  (by Benoit Blanchon, v6 or v7)
  *
  * Board: ESP32 Dev Module (or any ESP32 variant)
+ *
+ * IMPORTANT: SERVER must be ONLY the base host+port, e.g. "http://192.168.0.100:3001"
+ *            The /api/v1 prefix is added automatically in each request below.
  */
 
 #include <WiFi.h>
@@ -25,29 +29,37 @@
 const char* ssid     = "Raju";
 const char* password = "su@shi1907";
 
-// ── Velora server ─────────────────────────────────────
-// Use your local IP if running backend locally, e.g. "http://192.168.1.100:3001"
-// Use your deployed URL in production, e.g. "https://api.yourvelora.com"
-const char* serverUrl = "http://192.168.0.109:3001";
+// ── Velora server base URL ────────────────────────────
+// Local:      "http://192.168.0.100:3001"
+// Production: "https://api.yourvelora.com"
+// NOTE: Do NOT add /api/v1 here — it is added automatically in each request.
+const char* SERVER = "http://192.168.0.100:3001";
 
 // ── Device credentials ────────────────────────────────
-// Find these in: Dashboard → Devices → (your device) → Security tab
-const char* deviceId    = "5de8f19d-e5e9-4694-8e4f-05dd665e0a45";
-const char* deviceToken = "vlr_ab584ba73a1a2a3a9b3eba09599e3cf9c505304cff85e3f6";
+// Find in: Dashboard → Devices → (your device) → Security tab
+const char* DEVICE_ID    = "5de8f19d-e5e9-4694-8e4f-05dd665e0a45";
+const char* DEVICE_TOKEN = "vlr_ab584ba73a1a2a3a9b3eba09599e3cf9c505304cff85e3f6";
 
 // ── Datastream IDs ────────────────────────────────────
-// Find these in: Dashboard → Devices → (your device) → Datastreams tab
-const char* ds_temperature = "87ba2583-8a7c-4e38-8437-59c44df20615";
-const char* ds_humidity    = "3d9e3f70-e98e-4d96-ab60-51451840ce6a";
+// Find in: Dashboard → Devices → (your device) → Datastreams tab
+const char* DS_TEMP     = "87ba2583-8a7c-4e38-8437-59c44df20615"; // sensor → platform
+const char* DS_HUMIDITY = "3d9e3f70-e98e-4d96-ab60-51451840ce6a"; // sensor → platform
+const char* DS_LED_CMD  = "6dfe04cf-abd1-48d0-b088-0a5779b0da43"; // dashboard toggle → device
 
-// ── Current firmware version (MUST match what you upload in Firmware page) ──
+// ── Current firmware version ──────────────────────────
+// MUST match the version you upload on the Firmware page
 const char* CURRENT_VERSION = "1.0.0";
 
-// ── Timing constants (milliseconds) ──────────────────
-const unsigned long TELEMETRY_INTERVAL_MS = 5000;    // send data every 5 s
-const unsigned long OTA_CHECK_INTERVAL_MS = 300000;  // check OTA every 5 min
+// ── Hardware ──────────────────────────────────────────
+const int LED_PIN = 8; // built-in LED — ESP32-C3=8, classic ESP32=2
+
+// ── Timing (milliseconds) ─────────────────────────────
+const unsigned long TELEMETRY_INTERVAL_MS = 5000;   // telemetry every 5 s
+const unsigned long POLL_INTERVAL_MS      = 2000;   // LED command poll every 2 s
+const unsigned long OTA_CHECK_INTERVAL_MS = 30000; // OTA check every 5 min
 
 unsigned long lastTelemetryMs = 0;
+unsigned long lastPollMs      = 0;
 unsigned long lastOtaCheckMs  = 0;
 
 // ─────────────────────────────────────────────────────
@@ -56,6 +68,9 @@ unsigned long lastOtaCheckMs  = 0;
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH); // most boards: HIGH = LED off (active-low)
 
   Serial.println("\n[Velora] Booting...");
   connectWiFi();
@@ -70,19 +85,31 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Send telemetry
+  // Auto-reconnect WiFi if dropped
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Reconnecting...");
+    connectWiFi();
+  }
+
+  // 1. Send sensor telemetry
   if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryMs = now;
     sendTelemetry();
   }
 
-  // 2. Check for OTA update
+  // 2. Poll LED command from dashboard toggle widget
+  if (now - lastPollMs >= POLL_INTERVAL_MS) {
+    lastPollMs = now;
+    pollLedCommand();
+  }
+
+  // 3. Check for OTA firmware update
   if (now - lastOtaCheckMs >= OTA_CHECK_INTERVAL_MS) {
     lastOtaCheckMs = now;
     checkAndApplyOTA();
   }
 
-  delay(100);
+  delay(10);
 }
 
 // ─────────────────────────────────────────────────────
@@ -110,44 +137,43 @@ void connectWiFi() {
 // Add common device auth headers to any HTTPClient
 // ─────────────────────────────────────────────────────
 void addAuthHeaders(HTTPClient& http) {
-  http.addHeader("X-Device-Id",    deviceId);
-  http.addHeader("X-Device-Token", deviceToken);
+  http.addHeader("X-Device-Id",    DEVICE_ID);
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
   http.addHeader("Content-Type",   "application/json");
 }
 
 // ─────────────────────────────────────────────────────
-// Send sensor data as a batch to Velora
+// 1. Send sensor data as a batch to Velora
 // ─────────────────────────────────────────────────────
 void sendTelemetry() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // ── Replace with real sensor readings ────────────────
-  float temperature = 25.3 + (float)(random(-10, 10)) / 10.0;
-  float humidity    = 60.0 + (float)(random(-50, 50)) / 10.0;
-  // ─────────────────────────────────────────────────────
+  // ── Replace with real sensor reads ──────────────────
+  float temperature = 25.3f + (float)(random(-10, 10)) / 10.0f;
+  float humidity    = 60.0f + (float)(random(-50, 50)) / 10.0f;
+  // ────────────────────────────────────────────────────
 
-  // Build JSON: { "readings": [ { "datastreamId": "...", "value": ... }, ... ] }
   StaticJsonDocument<256> doc;
   JsonArray readings = doc.createNestedArray("readings");
 
   JsonObject t = readings.createNestedObject();
-  t["datastreamId"] = ds_temperature;
+  t["datastreamId"] = DS_TEMP;
   t["value"]        = temperature;
 
   JsonObject h = readings.createNestedObject();
-  h["datastreamId"] = ds_humidity;
+  h["datastreamId"] = DS_HUMIDITY;
   h["value"]        = humidity;
 
   String body;
   serializeJson(doc, body);
 
   HTTPClient http;
-  http.begin(String(serverUrl) + "/telemetry/batch");
+  http.begin(String(SERVER) + "/api/v1/telemetry/batch");
   addAuthHeaders(http);
 
   int code = http.POST(body);
   if (code == 200 || code == 201) {
-    Serial.printf("[Telemetry] Sent OK — temp=%.1f°C hum=%.1f%%\n", temperature, humidity);
+    Serial.printf("[Telemetry] Sent OK — temp=%.1f°C  hum=%.1f%%\n", temperature, humidity);
   } else {
     Serial.printf("[Telemetry] Failed: HTTP %d\n", code);
   }
@@ -155,7 +181,37 @@ void sendTelemetry() {
 }
 
 // ─────────────────────────────────────────────────────
-// Report OTA progress / result back to Velora
+// 2. Poll LED command written by the dashboard toggle widget
+//    Dashboard toggle → POST /api/v1/datastreams/:id/command { value: true }
+//    This reads back that stored value so the device acts on it.
+// ─────────────────────────────────────────────────────
+void pollLedCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(SERVER) + "/api/v1/datastreams/" + DS_LED_CMD + "/value";
+  http.begin(url);
+  http.addHeader("X-Device-Id",    DEVICE_ID);
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
+
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<128> doc;
+    deserializeJson(doc, payload);
+    // Response: { "success": true, "data": { "value": true/false/null } }
+    bool ledOn = doc["data"]["value"] | false;
+    // Active-low: LOW = on, HIGH = off
+    digitalWrite(LED_PIN, ledOn ? LOW : HIGH);
+    Serial.printf("[LED] %s\n", ledOn ? "ON" : "OFF");
+  } else {
+    Serial.printf("[LED] Poll failed: HTTP %d\n", code);
+  }
+  http.end();
+}
+
+// ─────────────────────────────────────────────────────
+// Helper: report OTA progress / result back to Velora
 // ─────────────────────────────────────────────────────
 void reportOTA(const String& deploymentId, const String& status,
                int progress = -1, const String& errorMsg = "",
@@ -163,24 +219,24 @@ void reportOTA(const String& deploymentId, const String& status,
   if (WiFi.status() != WL_CONNECTED) return;
 
   StaticJsonDocument<256> doc;
-  doc["deploymentId"] = deploymentId.c_str();
-  doc["status"]       = status.c_str();
+  doc["deploymentId"] = deploymentId;
+  doc["status"]       = status;
   if (progress >= 0)     doc["progress"]     = progress;
-  if (errorMsg.length()) doc["errorMessage"] = errorMsg.c_str();
-  if (version.length())  doc["version"]      = version.c_str();
+  if (errorMsg.length()) doc["errorMessage"] = errorMsg;
+  if (version.length())  doc["version"]      = version;
 
   String body;
   serializeJson(doc, body);
 
   HTTPClient http;
-  http.begin(String(serverUrl) + "/ota/device-report");
+  http.begin(String(SERVER) + "/api/v1/ota/device-report");
   addAuthHeaders(http);
   http.POST(body);
   http.end();
 }
 
 // ─────────────────────────────────────────────────────
-// Check Velora for a pending OTA update and apply it
+// 3. Check Velora for a pending OTA update and apply it
 // ─────────────────────────────────────────────────────
 void checkAndApplyOTA() {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -189,10 +245,10 @@ void checkAndApplyOTA() {
 
   // ── Step 1: Ask server if there is a pending update ──
   HTTPClient http;
-  String checkUrl = String(serverUrl) + "/ota/device-check?version=" + CURRENT_VERSION;
+  String checkUrl = String(SERVER) + "/api/v1/ota/device-check?version=" + CURRENT_VERSION;
   http.begin(checkUrl);
-  http.addHeader("X-Device-Id",    deviceId);
-  http.addHeader("X-Device-Token", deviceToken);
+  http.addHeader("X-Device-Id",    DEVICE_ID);
+  http.addHeader("X-Device-Token", DEVICE_TOKEN);
   int code = http.GET();
 
   if (code != 200) {
